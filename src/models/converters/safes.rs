@@ -1,3 +1,4 @@
+use crate::models::backend::safes::MasterCopy;
 use crate::models::service::addresses::AddressEx;
 use crate::models::service::safes::{ImplementationVersionState, SafeInfoEx};
 use crate::providers::ext::InfoProviderExt;
@@ -7,19 +8,27 @@ use std::cmp::Ordering;
 
 // We need to add Sync as trait bound as info_provider moves across threads
 impl SafeInfo {
-    pub async fn to_safe_info_ex(&self, info_provider: &(impl InfoProvider + Sync)) -> SafeInfoEx {
+    pub async fn to_safe_info_ex(
+        &self,
+        info_provider: &(impl InfoProvider + Sync),
+        supported_master_copies: Vec<MasterCopy>,
+    ) -> SafeInfoEx {
         let min_chain_version = info_provider
             .chain_info()
             .await
-            .ok()
-            .as_ref()
-            .map(|chain_info| chain_info.recommended_master_copy_version.to_string());
-        let implementation_version_state = self
-            .version
-            .as_ref()
-            .map_or(ImplementationVersionState::Unknown, |it| {
-                calculate_version_state(it, &min_chain_version)
-            });
+            .expect("ChainInfo must be available")
+            .recommended_master_copy_version;
+        let implementation_version_state =
+            self.version
+                .as_ref()
+                .map_or(ImplementationVersionState::Unknown, |safe_version| {
+                    calculate_version_state(
+                        safe_version,
+                        &supported_master_copies,
+                        min_chain_version,
+                    )
+                });
+
         SafeInfoEx {
             address: AddressEx::address_only(&self.address),
             nonce: self.nonce,
@@ -49,22 +58,30 @@ impl SafeInfo {
 
 pub(super) fn calculate_version_state(
     safe_version: &str,
-    min_chain_version: &Option<String>,
+    supported_master_copies: &Vec<MasterCopy>,
+    min_chain_version: String,
 ) -> ImplementationVersionState {
-    if let Some(min_chain_version) = min_chain_version {
-        let sem_ver_safe = Version::parse(safe_version);
-        let sem_ver_min = Version::parse(min_chain_version);
+    let sem_ver_safe = Version::parse(safe_version);
+    let sem_ver_min = Version::parse(&min_chain_version);
 
-        if sem_ver_min.is_err() || sem_ver_safe.is_err() {
-            return ImplementationVersionState::Unknown;
-        }
+    let supported_versions = supported_master_copies
+        .iter()
+        .filter_map(|it| Version::parse(&it.version).ok())
+        .collect::<Vec<Version>>();
 
-        match sem_ver_safe.unwrap().cmp(&sem_ver_min.unwrap()) {
-            Ordering::Less => ImplementationVersionState::Outdated,
-            Ordering::Equal => ImplementationVersionState::UpToDate,
-            Ordering::Greater => ImplementationVersionState::UpToDate,
-        }
-    } else {
-        ImplementationVersionState::Unknown
+    if sem_ver_min.is_err() || sem_ver_safe.is_err() || supported_versions.is_empty() {
+        return ImplementationVersionState::Unknown;
+    }
+
+    let sem_ver_safe = sem_ver_safe.unwrap();
+    let sem_ver_min = sem_ver_min.unwrap();
+
+    if !supported_versions.contains(&sem_ver_safe) {
+        return ImplementationVersionState::Unknown;
+    }
+
+    match sem_ver_safe.cmp(&sem_ver_min) {
+        Ordering::Less => ImplementationVersionState::Outdated,
+        Ordering::Equal | Ordering::Greater => ImplementationVersionState::UpToDate,
     }
 }
